@@ -1,0 +1,103 @@
+name: Smart Build Multi-Version PHP Images
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    # Prüft alle 12 Stunden (um 00:00 und 12:00 Uhr UTC) auf Updates
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php_version: [ '8.2', '8.3', '8.4', '8.5' ]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prüfe auf Update bei serversideup/php
+        id: check_update
+        env:
+          UPSTREAM_IMAGE: serversideup/php:${{ matrix.php_version }}-fpm
+          CUSTOM_IMAGE: ghcr.io/${{ github.repository_owner }}/php:${{ matrix.php_version }}-fpm
+        run: |
+          # 1. Aktuellen Digest von serversideup/php auf Docker Hub abfragen
+          UPSTREAM_DIGEST=$(docker buildx imagetools inspect "$UPSTREAM_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "Upstream Digest ($UPSTREAM_IMAGE): $UPSTREAM_DIGEST"
+          echo "upstream_digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
+
+          # 2. Wenn das eigene Dockerfile geändert oder manuell ausgelöst wurde -> Immer bauen
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Auslöser ist '${{ github.event_name }}' -> Erzwinge Neubau."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 3. Gespeicherten Upstream-Digest aus unserem eigenen Image auf ghcr.io auslesen
+          LAST_BASE_DIGEST=$(docker buildx imagetools inspect "$CUSTOM_IMAGE" --format '{{index .Image.Config.Labels "org.opencontainers.image.base.digest"}}' 2>/dev/null || echo "none")
+          echo "Zuletzt gebauter Digest ($CUSTOM_IMAGE): $LAST_BASE_DIGEST"
+
+          # 4. Vergleich
+          if [ "$UPSTREAM_DIGEST" != "$LAST_BASE_DIGEST" ]; then
+            echo "Neues Update bei serversideup/php gefunden! Starte Build..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Kein Update vorhanden. Überspringe Build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check_update.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push PHP ${{ matrix.php_version }}
+        if: steps.check_update.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          labels: |
+            org.opencontainers.image.base.name=serversideup/php:${{ matrix.php_version }}-fpm
+            org.opencontainers.image.base.digest=${{ steps.check_update.outputs.upstream_digest }}
+          tags: ghcr.io/${{ github.repository_owner }}/php:${{ matrix.php_version }}-fpm
+
+      - name: Pushover Benachrichtigung senden
+        if: steps.check_update.outputs.should_build == 'true'
+        env:
+          PUSHOVER_USER: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          CUSTOM_IMAGE: ghcr.io/${{ github.repository_owner }}/php:${{ matrix.php_version }}-fpm
+        run: |
+          if [ -n "$PUSHOVER_USER" ] && [ -n "$PUSHOVER_TOKEN" ]; then
+            # Exakte PHP-Version (z.B. 8.4.27) aus den Labels des neuen Images auslesen
+            EXACT_VER=$(docker buildx imagetools inspect "$CUSTOM_IMAGE" --format '{{index .Image.Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || echo "${{ matrix.php_version }}")
+
+            curl -s \
+              --form-string "token=${PUSHOVER_TOKEN}" \
+              --form-string "user=${PUSHOVER_USER}" \
+              --form-string "title=🐳 PHP ${{ matrix.php_version }} Image aktualisiert" \
+              --form-string "html=1" \
+              --form-string "message=Ein neues Update von <b>serversideup/php</b> wurde gebaut und auf <code>ghcr.io</code> bereitgestellt.<br><br><b>Image:</b> <code>custom-php:${{ matrix.php_version }}-fpm</code><br><b>Basis-Version:</b> <code>${EXACT_VER}</code><br><b>Auslöser:</b> ${{ github.event_name }}" \
+              --form-string "url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --form-string "url_title=GitHub Build-Log öffnen" \
+              https://api.pushover.net/1/messages.json
+          fi
