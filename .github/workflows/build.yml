@@ -4,9 +4,13 @@ on:
   push:
     branches: [ "main" ]
   schedule:
-    # Prüft alle 12 Stunden (um 00:00 und 12:00 Uhr UTC) auf Updates
-    - cron: '0 */12 * * *'
+    # Check every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
   workflow_dispatch:
+
+env:
+  DOCKERHUB_REPO: haraldsilva/php
+  GHCR_REPO: ghcr.io/haraldsilva/php
 
 jobs:
   build:
@@ -24,6 +28,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -31,34 +41,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Prüfe auf Update bei serversideup/php
+      - name: Check for upstream updates from serversideup/php
         id: check_update
         env:
           UPSTREAM_IMAGE: serversideup/php:${{ matrix.php_version }}-fpm
-          CUSTOM_IMAGE: ghcr.io/haraldsilva/php:${{ matrix.php_version }}-fpm
+          CUSTOM_IMAGE: ${{ env.DOCKERHUB_REPO }}:${{ matrix.php_version }}-fpm
         run: |
-          # 1. Aktuellen Digest von serversideup/php auf Docker Hub abfragen
           UPSTREAM_DIGEST=$(docker buildx imagetools inspect "$UPSTREAM_IMAGE" --format '{{json .Manifest.Digest}}' | tr -d '"')
           echo "Upstream Digest ($UPSTREAM_IMAGE): $UPSTREAM_DIGEST"
           echo "upstream_digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
 
-          # 2. Wenn das eigene Dockerfile geändert oder manuell ausgelöst wurde -> Immer bauen
           if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Auslöser ist '${{ github.event_name }}' -> Erzwinge Neubau."
+            echo "Triggered by '${{ github.event_name }}' -> Enforcing rebuild."
             echo "should_build=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # 3. Gespeicherten Upstream-Digest aus unserem eigenen Image auf ghcr.io auslesen
           LAST_BASE_DIGEST=$(docker buildx imagetools inspect "$CUSTOM_IMAGE" --format '{{index .Image.Config.Labels "org.opencontainers.image.base.digest"}}' 2>/dev/null || echo "none")
-          echo "Zuletzt gebauter Digest ($CUSTOM_IMAGE): $LAST_BASE_DIGEST"
+          echo "Last built digest ($CUSTOM_IMAGE): $LAST_BASE_DIGEST"
 
-          # 4. Vergleich
           if [ "$UPSTREAM_DIGEST" != "$LAST_BASE_DIGEST" ]; then
-            echo "Neues Update bei serversideup/php gefunden! Starte Build..."
+            echo "New upstream update detected! Triggering build..."
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
-            echo "Kein Update vorhanden. Überspringe Build."
+            echo "No update found. Skipping build."
             echo "should_build=false" >> $GITHUB_OUTPUT
           fi
 
@@ -66,7 +72,7 @@ jobs:
         if: steps.check_update.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and Push PHP ${{ matrix.php_version }}
+      - name: Build and Push Dual-Registry PHP ${{ matrix.php_version }}
         if: steps.check_update.outputs.should_build == 'true'
         uses: docker/build-push-action@v6
         with:
@@ -78,14 +84,26 @@ jobs:
           labels: |
             org.opencontainers.image.base.name=serversideup/php:${{ matrix.php_version }}-fpm
             org.opencontainers.image.base.digest=${{ steps.check_update.outputs.upstream_digest }}
-          tags: ghcr.io/haraldsilva/php:${{ matrix.php_version }}-fpm
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:${{ matrix.php_version }}-fpm
+            ${{ env.GHCR_REPO }}:${{ matrix.php_version }}-fpm
 
-      - name: Pushover Benachrichtigung senden
+      - name: Sync Readme to Docker Hub
+        if: steps.check_update.outputs.should_build == 'true' && matrix.php_version == '8.4'
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_REPO }}
+          short-description: "Security-hardened PHP-FPM images (UID 1000) for WordPress, Grav, and modern PHP applications based on serversideup/php."
+          readme-filepath: ./README.md
+
+      - name: Send Pushover Alert
         if: steps.check_update.outputs.should_build == 'true'
         env:
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER_KEY }}
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
-          CUSTOM_IMAGE: ghcr.io/haraldsilva/php:${{ matrix.php_version }}-fpm
+          CUSTOM_IMAGE: ${{ env.DOCKERHUB_REPO }}:${{ matrix.php_version }}-fpm
         run: |
           if [ -n "$PUSHOVER_USER" ] && [ -n "$PUSHOVER_TOKEN" ]; then
             EXACT_VER=$(docker buildx imagetools inspect "$CUSTOM_IMAGE" --format '{{index .Image.Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || echo "${{ matrix.php_version }}")
@@ -93,10 +111,10 @@ jobs:
             curl -s \
               --form-string "token=${PUSHOVER_TOKEN}" \
               --form-string "user=${PUSHOVER_USER}" \
-              --form-string "title=🐳 PHP ${{ matrix.php_version }} Image aktualisiert" \
+              --form-string "title=🐘 PHP ${{ matrix.php_version }} Dual-Push Completed" \
               --form-string "html=1" \
-              --form-string "message=Ein neues Update von <b>serversideup/php</b> wurde gebaut und auf <code>ghcr.io</code> bereitgestellt.<br><br><b>Image:</b> <code>ghcr.io/haraldsilva/php:${{ matrix.php_version }}-fpm</code><br><b>Basis-Version:</b> <code>${EXACT_VER}</code><br><b>Auslöser:</b> ${{ github.event_name }}" \
-              --form-string "url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-              --form-string "url_title=GitHub Build-Log öffnen" \
+              --form-string "message=PHP ${{ matrix.php_version }} has been rebuilt from a new <b>serversideup/php</b> release and pushed to both registries.<br><br><b>Docker Hub:</b> <code>${{ env.DOCKERHUB_REPO }}:${{ matrix.php_version }}-fpm</code><br><b>GHCR:</b> <code>${{ env.GHCR_REPO }}:${{ matrix.php_version }}-fpm</code><br><b>Base Version:</b> <code>${EXACT_VER}</code><br><b>Trigger:</b> ${{ github.event_name }}" \
+              --form-string "url=https://hub.docker.com/r/${{ env.DOCKERHUB_REPO }}/tags" \
+              --form-string "url_title=View on Docker Hub" \
               https://api.pushover.net/1/messages.json
           fi

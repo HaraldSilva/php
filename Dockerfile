@@ -3,10 +3,10 @@ FROM serversideup/php:${PHP_VERSION}-fpm
 
 USER root
 
-# 1. Fehlende Extensions installieren
+# Install missing extensions
 RUN install-php-extensions gd intl yaml mysqli exif apcu bcmath maxminddb
 
-# 2. Benutzer www-data fest auf UID/GID 1000 umstellen (wie bisher bei thecodingmachine)
+# Change user www-data to UID/GID 1000
 RUN docker-php-serversideup-set-id www-data 1000:1000 && \
     docker-php-serversideup-set-file-permissions --owner 1000:1000
 
