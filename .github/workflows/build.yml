@@ -88,16 +88,6 @@ jobs:
             ${{ env.DOCKERHUB_REPO }}:${{ matrix.php_version }}-fpm
             ${{ env.GHCR_REPO }}:${{ matrix.php_version }}-fpm
 
-      - name: Sync Readme to Docker Hub
-        if: steps.check_update.outputs.should_build == 'true' && matrix.php_version == '8.4'
-        uses: peter-evans/dockerhub-description@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ env.DOCKERHUB_REPO }}
-          short-description: "Security-hardened PHP-FPM images (UID 1000) for WordPress, Grav, and modern PHP applications based on serversideup/php."
-          readme-filepath: ./README.md
-
       - name: Send Pushover Alert
         if: steps.check_update.outputs.should_build == 'true'
         env:
